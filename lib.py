@@ -6,6 +6,7 @@ import os
 import random
 import operator
 from dataclasses import dataclass
+import ez
 
 import torch
 import numpy as np
@@ -16,9 +17,19 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 # ========================== MODEL CONFIG ==========================
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 # ==================================================================
 
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16).to(device)
+model.eval()
+
+tokenizer.padding_side = "left"
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+to_chat = ez.to_chat_fn(tokenizer)
 
 OPS = {"+": operator.add, "-": operator.sub, "*": operator.mul}
 
@@ -48,7 +59,7 @@ def _build_expression(nhops: int) -> Example:
         val = OPS[ops[i]](val, operands[i+1])
         intermediates.append(val)
 
-    prompt = f"Compute: {expr} ="
+    prompt = to_chat(f"{expr}", system_prompt="You are a helpful assistant. Response with just the answer. No other text.")[0]
     return Example(expression=expr, prompt=prompt, nhops=nhops, intermediates=intermediates)
 
 
@@ -71,15 +82,6 @@ def extract_hidden_states(examples: list[Example], batch_size: int = 64,
         print(f"Loading cached hidden states from {cache_path}")
         return torch.load(cache_path, weights_only=False)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading {MODEL_NAME} on {device}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16).to(device)
-    model.eval()
-
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
     n_layers = model.config.num_hidden_layers + 1  # +1 for embedding layer
     hidden_dim = model.config.hidden_size
@@ -90,20 +92,16 @@ def extract_hidden_states(examples: list[Example], batch_size: int = 64,
     for start in tqdm(range(0, len(examples), batch_size), desc="Extracting hidden states"):
         batch = examples[start:start + batch_size]
         prompts = [ex.prompt for ex in batch]
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
 
         with torch.no_grad():
-            outputs = model(**inputs, output_hidden_states=True)
+            outputs = ez.easy_forward(model, tokenizer, prompts, output_hidden_states=True)
 
         for layer_idx in range(n_layers):
             hs = outputs.hidden_states[layer_idx]
-            all_hidden[start:start + len(batch), layer_idx] = hs[:, -1, :].float().cpu()
+            all_hidden[start:start + len(batch), layer_idx] = hs[:, -1, :].float().cpu() # Hidden state 
 
-        gen_ids = model.generate(**inputs, max_new_tokens=10, do_sample=False)
-        for i, ex in enumerate(batch):
-            input_len = inputs["input_ids"].shape[1]
-            generated = tokenizer.decode(gen_ids[i, input_len:], skip_special_tokens=True).strip()
-            all_predictions.append(generated)
+        predictions = ez.easy_generate(model, tokenizer, prompts, output_completion_only=True, max_new_tokens=10, do_sample=False)
+        all_predictions.extend(predictions)
 
     result = {
         "hidden_states": all_hidden,

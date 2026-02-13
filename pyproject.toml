@@ -9,4 +9,8 @@ dependencies = [
     "matplotlib>=3.10",
     "tqdm>=4.67",
     "numpy>=2.2",
+    "ipykernel>=7.2.0",
+    "pandas>=3.0.0",
+    "jaxtyping>=0.3.7",
+    "seaborn>=0.13.2",
 ]
