@@ -11,12 +11,13 @@ import torch.nn as nn
 import numpy as np
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 
-# ========================== MODEL CONFIG ==========================
-MODEL_NAME = "Qwen/Qwen3-4B"
-# ==================================================================
+# ========================== CONFIG ==========================
+NUM_CLASSES = 100  # probe output classes (intermediates live in 0–99)
+MAX_LAYERS = 10    # subsample layers to at most this many
+# ============================================================
 
 
 @dataclass
@@ -60,26 +61,42 @@ def generate_data(n_per_hop: int = 10000, seed: int = 42) -> list[Example]:
 # Hidden state extraction
 # ---------------------------------------------------------------------------
 
-def extract_hidden_states(examples: list[Example], batch_size: int = 64,
-                          cache_path: str = "data/hidden_states.pt") -> dict:
-    if os.path.exists(cache_path):
-        print(f"Loading cached hidden states from {cache_path}")
-        return torch.load(cache_path, weights_only=False)
-
+def load_model(model_name: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading {MODEL_NAME} on {device}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.bfloat16).to(device)
+    print(f"Loading {model_name} on {device}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=bnb_config)
     model.eval()
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    n_layers = model.config.num_hidden_layers + 1  # +1 for embedding layer
-    hidden_dim = model.config.hidden_size
+    return tokenizer, model, device
 
-    all_hidden = torch.zeros(len(examples), n_layers, hidden_dim, dtype=torch.float32)
+
+def _pick_layers(n_layers: int) -> list[int]:
+    """Evenly subsample layer indices down to MAX_LAYERS, always including first and last."""
+    if n_layers <= MAX_LAYERS:
+        return list(range(n_layers))
+    return sorted(set(np.linspace(0, n_layers - 1, MAX_LAYERS, dtype=int).tolist()))
+
+
+def extract_hidden_states(model_name: str, examples: list[Example], batch_size: int = 64) -> dict:
+    cache_path = f"data/hidden_states_{model_name.replace('/', '_')}.pt"
+    if os.path.exists(cache_path):
+        print(f"Loading cached hidden states from {cache_path}")
+        return torch.load(cache_path, weights_only=False)
+
+    tokenizer, model, device = load_model(model_name)
+
+    n_layers_total = model.config.num_hidden_layers + 1  # +1 for embedding layer
+    layer_indices = _pick_layers(n_layers_total)
+    hidden_dim = model.config.hidden_size
+    print(f"Extracting {len(layer_indices)}/{n_layers_total} layers: {layer_indices}")
+
+    all_hidden = torch.zeros(len(examples), len(layer_indices), hidden_dim, dtype=torch.float32)
     all_predictions = []
 
     for start in tqdm(range(0, len(examples), batch_size), desc="Extracting hidden states"):
@@ -90,9 +107,9 @@ def extract_hidden_states(examples: list[Example], batch_size: int = 64,
         with torch.no_grad():
             outputs = model(**inputs, output_hidden_states=True)
 
-        for layer_idx in range(n_layers):
+        for i, layer_idx in enumerate(layer_indices):
             hs = outputs.hidden_states[layer_idx]
-            all_hidden[start:start + len(batch), layer_idx] = hs[:, -1, :].float().cpu()
+            all_hidden[start:start + len(batch), i] = hs[:, -1, :].float().cpu()
 
         gen_ids = model.generate(**inputs, max_new_tokens=10, do_sample=False)
         for i, ex in enumerate(batch):
@@ -105,6 +122,7 @@ def extract_hidden_states(examples: list[Example], batch_size: int = 64,
         "predictions": all_predictions,
         "intermediates": [ex.intermediates for ex in examples],
         "nhops": [ex.nhops for ex in examples],
+        "layer_indices": layer_indices,
     }
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     torch.save(result, cache_path)
@@ -128,9 +146,6 @@ def compute_accuracy(examples: list[Example], predictions: list[str]) -> dict[in
 # ---------------------------------------------------------------------------
 # Linear probes
 # ---------------------------------------------------------------------------
-
-NUM_CLASSES = 100
-
 
 def train_probes(data: dict, max_hop: int = 5, n_epochs: int = 100,
                  lr: float = 1e-2, batch_size: int = 512) -> tuple[np.ndarray, np.ndarray]:
