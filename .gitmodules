@@ -1,0 +1,3 @@
+[submodule "latent-multi-hop-reasoning"]
+	path = latent-multi-hop-reasoning
+	url = https://github.com/google-deepmind/latent-multi-hop-reasoning

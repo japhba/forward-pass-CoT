@@ -4,23 +4,19 @@ Backend library for decoding multi-hop arithmetic intermediates from hidden stat
 
 import os
 import random
-import operator
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
 import numpy as np
-from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
 # ========================== MODEL CONFIG ==========================
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = "Qwen/Qwen3-4B"
 # ==================================================================
-
-
-OPS = {"+": operator.add, "-": operator.sub, "*": operator.mul}
 
 
 @dataclass
@@ -38,21 +34,20 @@ class Example:
 def _build_expression(nhops: int) -> Example:
     n_operands = nhops + 1
     operands = [random.randint(2, 9) for _ in range(n_operands)]
-    ops = [random.choice(list(OPS.keys())) for _ in range(nhops)]
 
     intermediates = []
     val = operands[0]
     expr = str(operands[0])
     for i in range(nhops):
-        expr = f"({expr} {ops[i]} {operands[i+1]})"
-        val = OPS[ops[i]](val, operands[i+1])
+        expr = f"({expr} + {operands[i+1]})"
+        val = val + operands[i+1]
         intermediates.append(val)
 
     prompt = f"Compute: {expr} ="
     return Example(expression=expr, prompt=prompt, nhops=nhops, intermediates=intermediates)
 
 
-def generate_data(n_per_hop: int = 1000, seed: int = 42) -> list[Example]:
+def generate_data(n_per_hop: int = 10000, seed: int = 42) -> list[Example]:
     random.seed(seed)
     examples = []
     for nhops in tqdm([2, 3, 4, 5], desc="Generating data"):
@@ -134,31 +129,54 @@ def compute_accuracy(examples: list[Example], predictions: list[str]) -> dict[in
 # Linear probes
 # ---------------------------------------------------------------------------
 
-def train_probes(data: dict, max_hop: int = 5) -> np.ndarray:
+NUM_CLASSES = 100
+
+
+def train_probes(data: dict, max_hop: int = 5, n_epochs: int = 100,
+                 lr: float = 1e-2, batch_size: int = 512) -> tuple[np.ndarray, np.ndarray]:
+    """Returns (acc_matrix, loss_curves) where loss_curves is (n_layers, max_hop, n_epochs)."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     hidden_states = data["hidden_states"]
     intermediates = data["intermediates"]
     nhops_list = data["nhops"]
 
     n_examples, n_layers, hidden_dim = hidden_states.shape
-    r2_matrix = np.full((n_layers, max_hop), np.nan)
+    acc_matrix = np.full((n_layers, max_hop), np.nan)
+    loss_curves = np.full((n_layers, max_hop, n_epochs), np.nan)
 
     for hop_level in tqdm(range(1, max_hop + 1), desc="Hop levels"):
         mask = [i for i, nh in enumerate(nhops_list) if nh >= hop_level]
         if len(mask) < 50:
             continue
 
-        y = np.array([intermediates[i][hop_level - 1] for i in mask], dtype=np.float64)
-        X_all = hidden_states[mask]
+        y_all = torch.tensor([intermediates[i][hop_level - 1] for i in mask], dtype=torch.long, device=device)
+        X_all = hidden_states[mask]  # keep on CPU
 
-        X_train_idx, X_test_idx = train_test_split(range(len(mask)), test_size=0.2, random_state=42)
-        y_train, y_test = y[X_train_idx], y[X_test_idx]
+        train_idx, test_idx = train_test_split(range(len(mask)), test_size=0.2, random_state=42)
+        y_train, y_test = y_all[train_idx], y_all[test_idx]
 
         for layer_idx in tqdm(range(n_layers), desc=f"  Layers (hop {hop_level})", leave=False):
-            X_layer = X_all[:, layer_idx, :].numpy()
-            X_tr, X_te = X_layer[X_train_idx], X_layer[X_test_idx]
+            X_tr = X_all[train_idx, layer_idx].to(device)
+            X_te = X_all[test_idx, layer_idx].to(device)
 
-            reg = Ridge(alpha=1.0)
-            reg.fit(X_tr, y_train)
-            r2_matrix[layer_idx, hop_level - 1] = reg.score(X_te, y_test)
+            probe = nn.Linear(hidden_dim, NUM_CLASSES).to(device)
+            optimizer = torch.optim.Adam(probe.parameters(), lr=lr)
+            loss_fn = nn.CrossEntropyLoss()
 
-    return r2_matrix
+            for epoch in range(n_epochs):
+                probe.train()
+                perm = torch.randperm(X_tr.shape[0], device=device)
+                for start in range(0, X_tr.shape[0], batch_size):
+                    idx = perm[start:start + batch_size]
+                    optimizer.zero_grad()
+                    loss_fn(probe(X_tr[idx]), y_train[idx]).backward()
+                    optimizer.step()
+
+                probe.eval()
+                with torch.no_grad():
+                    loss_curves[layer_idx, hop_level - 1, epoch] = loss_fn(probe(X_te), y_test).item()
+
+            with torch.no_grad():
+                acc_matrix[layer_idx, hop_level - 1] = (probe(X_te).argmax(1) == y_test).float().mean().item()
+
+    return acc_matrix, loss_curves
