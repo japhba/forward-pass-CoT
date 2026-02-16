@@ -9,4 +9,9 @@ dependencies = [
     "matplotlib>=3.10",
     "tqdm>=4.67",
     "numpy>=2.2",
+    "ipywidgets",
+    "jupyterlab",
+    "python-dotenv",
+    "accelerate",
+    "bitsandbytes",
 ]

@@ -17,6 +17,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 # ========================== CONFIG ==========================
 NUM_CLASSES = 100  # probe output classes (intermediates live in 0–99)
 MAX_LAYERS = 10    # subsample layers to at most this many
+CACHE_DIR = os.path.join(os.environ["HF_HOME"], "forward-pass-CoT")
 # ============================================================
 
 
@@ -32,28 +33,37 @@ class Example:
 # Data generation
 # ---------------------------------------------------------------------------
 
-def _build_expression(nhops: int) -> Example:
-    n_operands = nhops + 1
-    operands = [random.randint(2, 9) for _ in range(n_operands)]
+NHOPS = 4
+OPERAND_RANGE = (2, 16)  # max intermediate = 16*5 = 80 < NUM_CLASSES
+TOLERANCES = [0, 2, 5]
+
+
+def _build_expression() -> Example:
+    n_operands = NHOPS + 1
+    operands = [random.randint(*OPERAND_RANGE) for _ in range(n_operands)]
 
     intermediates = []
     val = operands[0]
     expr = str(operands[0])
-    for i in range(nhops):
+    for i in range(NHOPS):
         expr = f"({expr} + {operands[i+1]})"
         val = val + operands[i+1]
         intermediates.append(val)
 
     prompt = f"Compute: {expr} ="
-    return Example(expression=expr, prompt=prompt, nhops=nhops, intermediates=intermediates)
+    return Example(expression=expr, prompt=prompt, nhops=NHOPS, intermediates=intermediates)
 
 
-def generate_data(n_per_hop: int = 10000, seed: int = 42) -> list[Example]:
+def generate_data(n: int = 10_000, seed: int = 42) -> list[Example]:
     random.seed(seed)
+    # 15^5 ≈ 760k unique expressions, so n=10k is duplicate-free
+    seen = set()
     examples = []
-    for nhops in tqdm([2, 3, 4, 5], desc="Generating data"):
-        for _ in range(n_per_hop):
-            examples.append(_build_expression(nhops))
+    while len(examples) < n:
+        ex = _build_expression()
+        if ex.expression not in seen:
+            seen.add(ex.expression)
+            examples.append(ex)
     return examples
 
 
@@ -84,7 +94,7 @@ def _pick_layers(n_layers: int) -> list[int]:
 
 
 def extract_hidden_states(model_name: str, examples: list[Example], batch_size: int = 64) -> dict:
-    cache_path = f"data/hidden_states_{model_name.replace('/', '_')}.pt"
+    cache_path = os.path.join(CACHE_DIR, f"hidden_states_{model_name.replace('/', '_')}.pt")
     if os.path.exists(cache_path):
         print(f"Loading cached hidden states from {cache_path}")
         return torch.load(cache_path, weights_only=False)
@@ -124,7 +134,7 @@ def extract_hidden_states(model_name: str, examples: list[Example], batch_size: 
         "nhops": [ex.nhops for ex in examples],
         "layer_indices": layer_indices,
     }
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
     torch.save(result, cache_path)
     print(f"Saved hidden states to {cache_path}")
     return result
@@ -134,38 +144,43 @@ def extract_hidden_states(model_name: str, examples: list[Example], batch_size: 
 # Accuracy summary
 # ---------------------------------------------------------------------------
 
-def compute_accuracy(examples: list[Example], predictions: list[str]) -> dict[int, tuple[int, int]]:
-    """Returns {nhops: (n_correct, n_total)}."""
-    correct_by_nhops: dict[int, list[bool]] = {}
-    for ex, pred in zip(examples, predictions):
-        expected = str(ex.intermediates[-1])
-        correct_by_nhops.setdefault(ex.nhops, []).append(pred.startswith(expected))
-    return {nh: (sum(vals), len(vals)) for nh, vals in sorted(correct_by_nhops.items())}
+def compute_accuracy(examples: list[Example], predictions: list[str]) -> tuple[int, int]:
+    """Returns (n_correct, n_total)."""
+    correct = sum(pred.startswith(str(ex.intermediates[-1])) for ex, pred in zip(examples, predictions))
+    return correct, len(examples)
 
 
 # ---------------------------------------------------------------------------
 # Linear probes
 # ---------------------------------------------------------------------------
 
-def train_probes(data: dict, max_hop: int = 5, n_epochs: int = 100,
-                 lr: float = 1e-2, batch_size: int = 512) -> tuple[np.ndarray, np.ndarray]:
-    """Returns (acc_matrix, loss_curves) where loss_curves is (n_layers, max_hop, n_epochs)."""
+def train_probes(data: dict, max_hop: int = NHOPS, n_epochs: int = 100,
+                 lr: float = 1e-2, batch_size: int = 512,
+                 cache_name: str = "probes") -> tuple[np.ndarray, np.ndarray]:
+    """Returns (acc_matrix, loss_curves).
+    acc_matrix: (n_layers, max_hop, len(TOLERANCES)) — accuracy at each tolerance.
+    loss_curves: (n_layers, max_hop, n_epochs).
+    """
+    cache_path = os.path.join(CACHE_DIR, f"{cache_name}.npz")
+    if os.path.exists(cache_path):
+        print(f"Loading cached probe results from {cache_path}")
+        cached = np.load(cache_path)
+        return cached["acc_matrix"], cached["loss_curves"]
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     hidden_states = data["hidden_states"]
     intermediates = data["intermediates"]
     nhops_list = data["nhops"]
 
     n_examples, n_layers, hidden_dim = hidden_states.shape
-    acc_matrix = np.full((n_layers, max_hop), np.nan)
+    n_tol = len(TOLERANCES)
+    acc_matrix = np.full((n_layers, max_hop, n_tol), np.nan)
     loss_curves = np.full((n_layers, max_hop, n_epochs), np.nan)
 
     for hop_level in tqdm(range(1, max_hop + 1), desc="Hop levels"):
         mask = [i for i, nh in enumerate(nhops_list) if nh >= hop_level]
-        if len(mask) < 50:
-            continue
-
         y_all = torch.tensor([intermediates[i][hop_level - 1] for i in mask], dtype=torch.long, device=device)
-        X_all = hidden_states[mask]  # keep on CPU
+        X_all = hidden_states[mask]
 
         train_idx, test_idx = train_test_split(range(len(mask)), test_size=0.2, random_state=42)
         y_train, y_test = y_all[train_idx], y_all[test_idx]
@@ -192,6 +207,12 @@ def train_probes(data: dict, max_hop: int = 5, n_epochs: int = 100,
                     loss_curves[layer_idx, hop_level - 1, epoch] = loss_fn(probe(X_te), y_test).item()
 
             with torch.no_grad():
-                acc_matrix[layer_idx, hop_level - 1] = (probe(X_te).argmax(1) == y_test).float().mean().item()
+                preds = probe(X_te).argmax(1)
+                error = (preds - y_test).abs()
+                for ti, tol in enumerate(TOLERANCES):
+                    acc_matrix[layer_idx, hop_level - 1, ti] = (error <= tol).float().mean().item()
 
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    np.savez(cache_path, acc_matrix=acc_matrix, loss_curves=loss_curves)
+    print(f"Saved probe results to {cache_path}")
     return acc_matrix, loss_curves
